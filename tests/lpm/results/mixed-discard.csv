@@ -1,0 +1,17 @@
+operation,implementation,workers,output_sink,input_bytes,compressed_bytes,median_seconds,input_MiB_per_second
+compress,baseline,1,discard,39770112,12608476,0.064827,585.058
+compress,candidate,1,discard,39770112,12608476,0.060400,627.946
+compress,baseline,2,discard,39770112,12608476,0.044118,859.690
+compress,candidate,2,discard,39770112,12608476,0.039410,962.385
+compress,baseline,4,discard,39770112,12608476,0.045659,830.678
+compress,candidate,4,discard,39770112,12608476,0.041651,910.599
+compress,baseline,8,discard,39770112,12608476,0.044425,853.746
+compress,candidate,8,discard,39770112,12608435,0.038927,974.325
+decompress,baseline,1,discard,39770112,12608318,0.023964,1582.727
+decompress,candidate,1,discard,39770112,12608318,0.020743,1828.417
+decompress,baseline,2,discard,39770112,12608318,0.024547,1545.117
+decompress,candidate,2,discard,39770112,12608318,0.018644,2034.306
+decompress,baseline,4,discard,39770112,12608318,0.024921,1521.928
+decompress,candidate,4,discard,39770112,12608318,0.016938,2239.175
+decompress,baseline,8,discard,39770112,12608318,0.028328,1338.894
+decompress,candidate,8,discard,39770112,12608318,0.025365,1495.304

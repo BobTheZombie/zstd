@@ -34,3 +34,7 @@ option('lzma', type: 'feature', value: 'auto',
   description: 'Enable lzma support')
 option('lz4', type: 'feature', value: 'auto',
   description: 'Enable lz4 support')
+
+option('cpu_tune', type: 'combo', value: 'default',
+  choices: ['default', 'generic', 'znver1', 'znver2', 'znver3', 'znver4', 'znver5'],
+  description: 'Compiler scheduling tune; does not raise the target ISA baseline')

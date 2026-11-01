@@ -9,6 +9,8 @@
 #include "platform.h"   /* Large Files support, SET_BINARY_MODE */
 #include "Pzstd.h"
 #include "SkippableFrame.h"
+#include "mem.h"
+#include "util.h"
 #include "utils/FileSystem.h"
 #include "utils/Portability.h"
 #include "utils/Range.h"
@@ -36,6 +38,8 @@ const std::string nullOutput = "/dev/null";
 }
 
 using std::size_t;
+
+static constexpr size_t kParallelIOSize = size_t{1} << 20;
 
 static std::uintmax_t fileSizeOrZero(const std::string &file) {
   if (file == "-") {
@@ -188,29 +192,37 @@ int pzstdMain(const Options &options) {
                            "Input file does not have extension .zst")) {
       continue;
     }
+    if (input != "-" && outputFile != "-" &&
+        !state.errorHolder.check(!UTIL_isSameFile(input.c_str(), outputFile.c_str()),
+                                "Input and output refer to the same file")) {
+      continue;
+    }
     auto outputFd = openOutputFile(options, outputFile, state);
     if (outputFd == nullptr) {
       continue;
     }
-    auto closeOutputGuard = makeScopeGuard([&] { std::fclose(outputFd); });
+    auto closeOutputGuard = makeScopeGuard([&] {
+      if (outputFd != stdout) std::fclose(outputFd);
+    });
     // (de)compress the file
     handleOneInput(options, input, inputFd, outputFile, outputFd, state);
+    // Buffered writes may fail only at flush/close. Never report success or
+    // remove a source before this result has been checked.
+    const int outputStatus = outputFd == stdout ? std::fflush(outputFd)
+                                                : std::fclose(outputFd);
+    closeOutputGuard.dismiss();
+    state.errorHolder.check(outputStatus == 0, "Failed to close or flush output file");
     if (state.errorHolder.hasError()) {
       continue;
     }
     // Delete the input file if necessary
     if (!options.keepSource) {
       // Be sure that we are done and have written everything before we delete
-      if (!state.errorHolder.check(std::fclose(inputFd) == 0,
-                             "Failed to close input file")) {
-        continue;
-      }
+      const int inputStatus = std::fclose(inputFd);
       closeInputGuard.dismiss();
-      if (!state.errorHolder.check(std::fclose(outputFd) == 0,
-                             "Failed to close output file")) {
+      if (!state.errorHolder.check(inputStatus == 0, "Failed to close input file")) {
         continue;
       }
-      closeOutputGuard.dismiss();
       if (std::remove(input.c_str()) != 0) {
         state.errorHolder.setError("Failed to remove input file");
         continue;
@@ -306,7 +318,8 @@ static void compress(
           return;
         }
         // Split the compressed data off outBuffer and pass to the output queue
-        out->push(split(outBuffer, zstdOutBuffer));
+        auto output = split(outBuffer, zstdOutBuffer);
+        if (!output.empty()) out->push(std::move(output));
         // Forget about the data we already compressed
         advance(inBuffer, zstdInBuffer);
       }
@@ -324,7 +337,8 @@ static void compress(
             !ZSTD_isError(bytesLeft), ZSTD_getErrorName(bytesLeft))) {
       return;
     }
-    out->push(split(outBuffer, zstdOutBuffer));
+    auto output = split(outBuffer, zstdOutBuffer);
+    if (!output.empty()) out->push(std::move(output));
   } while (bytesLeft != 0 && !errorHolder.hasError());
 }
 
@@ -339,13 +353,21 @@ static size_t calculateStep(
     std::uintmax_t size,
     size_t numThreads,
     const ZSTD_parameters &params) {
-  (void)size;
-  (void)numThreads;
+
   // Not validated to work correctly for window logs > 23.
   // It will definitely fail if windowLog + 2 is >= 4GB because
   // the skippable frame can only store sizes up to 4GB.
   assert(params.cParams.windowLog <= 23);
-  return size_t{1} << (params.cParams.windowLog + 2);
+  size_t step = size_t{1} << (params.cParams.windowLog + 2);
+  // Give medium-sized regular files enough independent frames to occupy
+  // the workers. Preserve the old cap and avoid sub-MiB frame overhead.
+  if (size != 0 && numThreads > 1) {
+    const auto target = size / numThreads + (size % numThreads != 0);
+    while (step > (size_t{1} << 20) && step > target) {
+      step /= 2;
+    }
+  }
+  return step;
 }
 
 namespace {
@@ -414,7 +436,8 @@ std::uint64_t asyncCompressChunks(
     chunks.push(std::move(out));
     state.log(kLogVerbose, "%s\n", "Starting a new frame");
     // Fill the input queue for the compression job we just started
-    status = readData(*in, ZSTD_CStreamInSize(), step, fd, &bytesRead);
+    status = readData(*in, std::max(ZSTD_CStreamInSize(), kParallelIOSize),
+                      step, fd, &bytesRead);
   }
   state.errorHolder.check(status != FileStatus::Error, "Error reading input");
   return bytesRead;
@@ -450,7 +473,7 @@ static void decompress(
     }
   }
 
-  const size_t outSize = ZSTD_DStreamOutSize();
+  const size_t outSize = std::max(ZSTD_DStreamOutSize(), kParallelIOSize);
   Buffer inBuffer;
   size_t returnCode = 0;
   // Read a buffer in from the input queue
@@ -469,7 +492,8 @@ static void decompress(
         return;
       }
       // Pass the buffer with the decompressed data to the output queue
-      out->push(split(outBuffer, zstdOutBuffer));
+      auto output = split(outBuffer, zstdOutBuffer);
+      if (!output.empty()) out->push(std::move(output));
       // Advance past the input we already read
       advance(inBuffer, zstdInBuffer);
       if (returnCode == 0) {
@@ -496,10 +520,80 @@ static void decompress(
             !ZSTD_isError(returnCode), ZSTD_getErrorName(returnCode))) {
       return;
     }
+    if (!errorHolder.check(returnCode == 0 || zstdOutBuffer.pos != 0,
+                           "Incomplete frame")) {
+      return;
+    }
     // Pass the buffer with the decompressed data to the output queue
-    out->push(split(outBuffer, zstdOutBuffer));
+    auto output = split(outBuffer, zstdOutBuffer);
+    if (!output.empty()) out->push(std::move(output));
   }
 }
+
+namespace {
+// Read a bounded piece, distinguishing an I/O error from a truncated frame.
+bool readExact(SharedState& state, FILE* fd, void* dst, size_t size,
+               std::uint64_t& total) {
+  const auto count = std::fread(dst, 1, size, fd);
+  total += count;
+  return state.errorHolder.check(count == size,
+      std::ferror(fd) ? "Error reading input" : "Truncated frame");
+}
+
+bool skipBytes(SharedState& state, FILE* fd, size_t size, std::uint64_t& total) {
+  Buffer data(std::min(size, ZSTD_DStreamInSize()));
+  while (size != 0 && !state.errorHolder.hasError()) {
+    const auto count = std::min(size, ZSTD_DStreamInSize());
+    if (!readExact(state, fd, data.data(), count, total)) {
+      return false;
+    }
+    size -= count;
+  }
+  return !state.errorHolder.hasError();
+}
+// Batch headers and payloads into large queue messages. Small block-header
+// messages otherwise dominate fast decoding with allocations and wakeups.
+class FrameInput {
+  BufferWorkQueue& queue_;
+  Buffer buffer_{kParallelIOSize};
+  size_t used_ = 0;
+
+ public:
+  explicit FrameInput(BufferWorkQueue& queue) : queue_(queue) {}
+
+  void flush(bool more = true) {
+    if (used_ != 0) {
+      buffer_.subtract(buffer_.size() - used_);
+      queue_.push(std::move(buffer_));
+      buffer_ = more ? Buffer(kParallelIOSize) : Buffer();
+      used_ = 0;
+    }
+  }
+
+  void append(const void* source, size_t size) {
+    auto bytes = static_cast<const unsigned char*>(source);
+    while (size != 0) {
+      const auto count = std::min(size, buffer_.size() - used_);
+      std::copy(bytes, bytes + count, buffer_.data() + used_);
+      used_ += count;
+      bytes += count;
+      size -= count;
+      if (used_ == buffer_.size()) flush();
+    }
+  }
+
+  bool read(SharedState& state, FILE* fd, size_t size, std::uint64_t& total) {
+    while (size != 0 && !state.errorHolder.hasError()) {
+      const auto count = std::min(size, buffer_.size() - used_);
+      if (!readExact(state, fd, buffer_.data() + used_, count, total)) return false;
+      used_ += count;
+      size -= count;
+      if (used_ == buffer_.size()) flush();
+    }
+    return !state.errorHolder.hasError();
+  }
+};
+} // anonymous namespace
 
 std::uint64_t asyncDecompressFrames(
     SharedState& state,
@@ -508,62 +602,113 @@ std::uint64_t asyncDecompressFrames(
     FILE* fd) {
   auto framesGuard = makeScopeGuard([&] { frames.finish(); });
   std::uint64_t totalBytesRead = 0;
+  bool sawFrame = false;
 
-  // Split the source up into its component frames.
-  // If we find our recognized skippable frame we know the next frames size
-  // which means that we can decompress each standard frame in independently.
-  // Otherwise, we will decompress using only one decompression task.
-  const size_t chunkSize = ZSTD_DStreamInSize();
-  auto status = FileStatus::Continue;
-  while (status == FileStatus::Continue && !state.errorHolder.hasError()) {
-    // Make a new input queue that we will put the frames's bytes into.
-    auto in = std::make_shared<BufferWorkQueue>();
-    auto inGuard = makeScopeGuard([&] { in->finish(); });
-    // Make a output queue that decompress will put the decompressed data into
-    auto out = std::make_shared<BufferWorkQueue>();
-
-    size_t frameSize;
-    {
-      // Calculate the size of the next frame.
-      // frameSize is 0 if the frame info can't be decoded.
-      Buffer buffer(SkippableFrame::kSize);
-      auto bytesRead = std::fread(buffer.data(), 1, buffer.size(), fd);
-      totalBytesRead += bytesRead;
-      status = fileStatus(fd);
-      if (bytesRead == 0 && status != FileStatus::Continue) {
-        break;
-      }
-      buffer.subtract(buffer.size() - bytesRead);
-      frameSize = SkippableFrame::tryRead(buffer.range());
-      in->push(std::move(buffer));
-    }
-    if (frameSize == 0) {
-      // We hit a non SkippableFrame, so this will be the last job.
-      // Make sure that we don't use too much memory
-      in->setMaxSize(64);
-      out->setMaxSize(64);
-    }
-    // Start decompression in the thread pool
-    executor.add([&state, in, out] {
-      return decompress(state, std::move(in), std::move(out));
-    });
-    // Pass the output queue to the writer thread
-    frames.push(std::move(out));
-    if (frameSize == 0) {
-      // We hit a non SkippableFrame ==> not compressed by pzstd or corrupted
-      // Pass the rest of the source to this decompression task
-      state.log(kLogVerbose, "%s\n",
-          "Input not in pzstd format, falling back to serial decompression");
-      while (status == FileStatus::Continue && !state.errorHolder.hasError()) {
-        status = readData(*in, chunkSize, chunkSize, fd, &totalBytesRead);
-      }
+  // Delimit actual standard frames by their block headers. This works for
+  // ordinary concatenated .zst streams, unknown content sizes, and pipes;
+  // pzstd's optional skippable size hints are no longer trusted as indexes.
+  while (!state.errorHolder.hasError()) {
+    unsigned char prefix[4];
+    const auto count = std::fread(prefix, 1, sizeof(prefix), fd);
+    totalBytesRead += count;
+    if (count == 0 && std::feof(fd)) {
+      state.errorHolder.check(sawFrame, "Empty compressed input");
       break;
     }
-    state.log(kLogVerbose, "Decompressing a frame of size %zu", frameSize);
-    // Fill the input queue for the decompression job we just started
-    status = readData(*in, chunkSize, frameSize, fd, &totalBytesRead);
+    if (!state.errorHolder.check(count == sizeof(prefix),
+          std::ferror(fd) ? "Error reading input" : "Truncated frame magic")) {
+      break;
+    }
+    const auto magic = MEM_readLE32(prefix);
+    if ((magic & 0xfffffff0U) == ZSTD_MAGIC_SKIPPABLE_START) {
+      unsigned char length[4];
+      if (!readExact(state, fd, length, sizeof(length), totalBytesRead) ||
+          !skipBytes(state, fd, MEM_readLE32(length), totalBytesRead)) {
+        break;
+      }
+      sawFrame = true;
+      continue;
+    }
+
+    // Bounded queues provide backpressure even for huge or unknown-size
+    // frames. Only the writer emits output, preserving frame order.
+    auto in = std::make_shared<BufferWorkQueue>(4);
+    auto out = std::make_shared<BufferWorkQueue>(4);
+    auto inGuard = makeScopeGuard([&] { in->finish(); });
+    executor.add([&state, in, out] {
+      decompress(state, in, out);
+    });
+    frames.push(std::move(out));
+    sawFrame = true;
+
+    if (magic != ZSTD_MAGICNUMBER) {
+      // Preserve the legacy decoder path without inventing boundaries for
+      // formats not described by the current Zstandard frame specification.
+      Buffer first(sizeof(prefix));
+      std::copy(prefix, prefix + sizeof(prefix), first.data());
+      in->push(std::move(first));
+      auto status = FileStatus::Continue;
+      while (status == FileStatus::Continue && !state.errorHolder.hasError()) {
+        status = readData(*in, ZSTD_DStreamInSize(), ZSTD_DStreamInSize(),
+                          fd, &totalBytesRead);
+      }
+      state.errorHolder.check(status != FileStatus::Error, "Error reading input");
+      break;
+    }
+
+    Buffer header(ZSTD_FRAMEHEADERSIZE_MAX);
+    std::copy(prefix, prefix + sizeof(prefix), header.data());
+    size_t headerSize = sizeof(prefix);
+    ZSTD_frameHeader frameHeader;
+    while (!state.errorHolder.hasError()) {
+      const auto needed = ZSTD_getFrameHeader(&frameHeader, header.data(), headerSize);
+      if (!state.errorHolder.check(!ZSTD_isError(needed), ZSTD_getErrorName(needed))) {
+        break;
+      }
+      if (needed == 0) {
+        break;
+      }
+      if (!state.errorHolder.check(needed > headerSize && needed <= header.size(),
+                                  "Invalid frame header size") ||
+          !readExact(state, fd, header.data() + headerSize,
+                     needed - headerSize, totalBytesRead)) {
+        break;
+      }
+      headerSize = needed;
+    }
+    if (state.errorHolder.hasError()) {
+      break;
+    }
+    FrameInput input(*in);
+    input.append(header.data(), headerSize);
+    state.log(kLogVerbose, "%s\n", "Decompressing an independent frame");
+
+    bool last = false;
+    do {
+      unsigned char block[3];
+      if (!readExact(state, fd, block, sizeof(block), totalBytesRead)) {
+        break;
+      }
+      const auto bits = static_cast<unsigned>(block[0]) |
+          (static_cast<unsigned>(block[1]) << 8) |
+          (static_cast<unsigned>(block[2]) << 16);
+      last = (bits & 1) != 0;
+      const auto type = (bits >> 1) & 3;
+      const auto size = bits >> 3;
+      if (!state.errorHolder.check(type != 3 && size <= frameHeader.blockSizeMax,
+                                  "Invalid block header")) {
+        break;
+      }
+      input.append(block, sizeof(block));
+      if (!input.read(state, fd, type == 1 ? 1 : size, totalBytesRead)) {
+        break;
+      }
+    } while (!last && !state.errorHolder.hasError());
+    if (!state.errorHolder.hasError() && frameHeader.checksumFlag) {
+      input.read(state, fd, 4, totalBytesRead);
+    }
+    input.flush(false);
   }
-  state.errorHolder.check(status != FileStatus::Error, "Error reading input");
   return totalBytesRead;
 }
 
