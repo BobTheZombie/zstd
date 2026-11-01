@@ -33,6 +33,14 @@ LDFLAGS  ?=
 # PZstd uses legacy APIs
 CFLAGS   += -Wno-deprecated-declarations
 
+ifneq ($(strip $(ZSTD_CPU_TUNE)),)
+  PZSTD_TUNE_SUPPORTED := $(shell printf 'int x;' | $(CXX) -mtune=$(ZSTD_CPU_TUNE) -Werror -x c++ -c - -o /dev/null 2>/dev/null && echo 1)
+  ifneq ($(PZSTD_TUNE_SUPPORTED),1)
+    $(error $(CXX) does not support -mtune=$(ZSTD_CPU_TUNE))
+  endif
+  CXXFLAGS += -mtune=$(ZSTD_CPU_TUNE)
+endif
+
 # Include flags
 PZSTD_INC  = -I$(ZSTDDIR) -I$(ZSTDDIR)/common -I$(PROGDIR) -I.
 GTEST_INC  = -isystem googletest/googletest/include

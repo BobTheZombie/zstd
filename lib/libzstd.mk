@@ -101,6 +101,20 @@ else
   CFLAGS ?= -O3
 endif
 
+# Optional CPU scheduling tune. Never imply -march or bypass runtime dispatch.
+ZSTD_CPU_TUNE ?=
+ifneq ($(strip $(ZSTD_CPU_TUNE)),)
+  ifneq ($(filter $(ZSTD_CPU_TUNE),generic znver1 znver2 znver3 znver4 znver5),$(ZSTD_CPU_TUNE))
+    $(error ZSTD_CPU_TUNE must be generic or znver1 through znver5)
+  endif
+  ZSTD_TUNE_FLAG := -mtune=$(ZSTD_CPU_TUNE)
+  ZSTD_TUNE_SUPPORTED := $(shell printf 'int x;' | $(CC) $(ZSTD_TUNE_FLAG) -Werror -x c -c - -o $(VOID) 2> $(VOID) && echo 1)
+  ifneq ($(ZSTD_TUNE_SUPPORTED),1)
+    $(error $(CC) does not support $(ZSTD_TUNE_FLAG))
+  endif
+  CFLAGS += $(ZSTD_TUNE_FLAG)
+endif
+
 DEBUGLEVEL ?= 0
 CPPFLAGS += -DXXH_NAMESPACE=ZSTD_ -DDEBUGLEVEL=$(DEBUGLEVEL)
 ifeq ($(TARGET_SYSTEM),Windows_NT)   # MinGW assumed

@@ -30,6 +30,15 @@ project('zstd',
 
 cc = meson.get_compiler('c')
 cxx = meson.get_compiler('cpp')
+cpu_tune = get_option('cpu_tune')
+if cpu_tune != 'default'
+  tune_flag = '-mtune=' + cpu_tune
+  if not cc.has_argument(tune_flag) or not cxx.has_argument(tune_flag)
+    error('Selected compilers do not support ' + tune_flag)
+  endif
+  add_project_arguments(tune_flag, language: ['c', 'cpp'])
+endif
+
 pkgconfig = import('pkgconfig')
 windows_mod = import('windows')
 

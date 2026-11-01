@@ -34,6 +34,22 @@ project(zstd
     DESCRIPTION "${zstd_DESCRIPTION}"
 )
 
+# Optional scheduling tuning, without changing the instruction set or ABI.
+set(ZSTD_CPU_TUNE "" CACHE STRING "CPU tune: generic or znver1 through znver5")
+set_property(CACHE ZSTD_CPU_TUNE PROPERTY STRINGS "" generic znver1 znver2 znver3 znver4 znver5)
+if(NOT ZSTD_CPU_TUNE STREQUAL "")
+    if(NOT ZSTD_CPU_TUNE MATCHES "^(generic|znver[1-5])$")
+        message(FATAL_ERROR "Unsupported ZSTD_CPU_TUNE value")
+    endif()
+    include(CheckCCompilerFlag)
+    check_c_compiler_flag("-mtune=${ZSTD_CPU_TUNE}" ZSTD_HAS_CPU_TUNE_${ZSTD_CPU_TUNE})
+    if(NOT ZSTD_HAS_CPU_TUNE_${ZSTD_CPU_TUNE})
+        message(FATAL_ERROR "Compiler does not support -mtune=${ZSTD_CPU_TUNE}")
+    endif()
+    add_compile_options("$<$<COMPILE_LANGUAGE:C>:-mtune=${ZSTD_CPU_TUNE}>"
+                        "$<$<COMPILE_LANGUAGE:CXX>:-mtune=${ZSTD_CPU_TUNE}>")
+endif()
+
 #-----------------------------------------------------------------------------
 # Build type configuration
 #-----------------------------------------------------------------------------
