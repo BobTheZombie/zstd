@@ -10,6 +10,8 @@
 
 #include <gtest/gtest.h>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <thread>
 
 using namespace pzstd;
@@ -69,4 +71,36 @@ TEST(ResourcePool, ThreadSafe) {
   }
   EXPECT_GE(2, numCreated);
   EXPECT_EQ(numCreated, numDeleted);
+}
+
+TEST(ResourcePool, FactoriesRunConcurrently) {
+  std::mutex mutex;
+  std::condition_variable cv;
+  unsigned entered = 0;
+  std::atomic<unsigned> rendezvous{0};
+  ResourcePool<int> pool([&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    ++entered;
+    cv.notify_all();
+    if (cv.wait_for(lock, std::chrono::seconds(2), [&] { return entered == 2; })) {
+      ++rendezvous;
+    }
+    return new int{42};
+  }, [](int* value) { delete value; });
+  auto acquire = [&] {
+    auto resource = pool.get();
+    EXPECT_EQ(42, *resource);
+  };
+  std::thread first(acquire);
+  std::thread second(acquire);
+  first.join();
+  second.join();
+  EXPECT_EQ(2U, rendezvous.load());
+}
+
+TEST(ResourcePool, NullFactoryDoesNotBorrowAResource) {
+  ResourcePool<int> pool([]() -> int* { return nullptr; },
+                         [](int* value) { delete value; });
+  auto resource = pool.get();
+  EXPECT_EQ(nullptr, resource.get());
 }

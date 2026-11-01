@@ -19,7 +19,8 @@ namespace pzstd {
 /**
  * An unbounded pool of resources.
  * A `ResourcePool<T>` requires a factory function that takes allocates `T*` and
- * a free function that frees a `T*`.
+ * a free function that frees a `T*`. The factory must support concurrent calls;
+ * the owner must not destroy the pool while get() or a borrowed resource is active.
  * Calling `ResourcePool::get()` will give you a new `ResourcePool::UniquePtr`
  * to a `T`, and when it goes out of scope the resource will be returned to the
  * pool.
@@ -57,15 +58,19 @@ class ResourcePool {
    *           there are no available resources and `factory()` returns null.
    */
   UniquePtr get() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     if (!resources_.empty()) {
       UniquePtr resource{resources_.back(), Deleter{*this}};
       resources_.pop_back();
       ++inUse_;
       return resource;
     }
+    // Context creation can allocate/initialize megabytes. Do it concurrently
+    // rather than serializing every worker behind the pool bookkeeping lock.
+    lock.unlock();
     UniquePtr resource{factory_(), Deleter{*this}};
-    ++inUse_;
+    lock.lock();
+    if (resource) ++inUse_;
     return resource;
   }
 
