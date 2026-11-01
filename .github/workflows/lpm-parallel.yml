@@ -1,0 +1,57 @@
+name: LPM parallel integrity and ABI
+on:
+  pull_request:
+    paths:
+      - 'lib/libzstd.mk'
+      - 'contrib/pzstd/**'
+      - 'build/meson/**'
+      - 'build/cmake/CMakeLists.txt'
+      - 'tests/lpm/**'
+      - '.github/workflows/lpm-parallel.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  integrity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    env:
+      CC: '${{ matrix.compiler }}'
+      CXX: '${{ matrix.compiler == ''gcc'' && ''g++'' || ''clang++'' }}'
+      BASE_SHA: '${{ github.event.pull_request.base.sha || ''49cf51799ea051457f57243527aa2058f999f005'' }}'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y meson ninja-build libgtest-dev clang cmake
+      - name: Build reference and tuned candidate
+        run: |
+          git fetch --depth=1 origin "$BASE_SHA"
+          git worktree add --detach ../baseline "$BASE_SHA"
+          meson setup baseline-build ../baseline/build/meson -Dbin_contrib=true -Dzlib=disabled -Dlzma=disabled -Dlz4=disabled
+          ninja -C baseline-build -j2
+          meson setup build build/meson -Dbin_contrib=true -Dbin_tests=true -Dcpu_tune=znver2 -Dzlib=disabled -Dlzma=disabled -Dlz4=disabled
+          ninja -C build -j2
+      - name: Upstream tests and ABI
+        run: |
+          meson test -C build --no-rebuild --num-processes 2 --print-errorlogs
+          python3 tests/lpm/check_abi.py --baseline baseline-build/lib/libzstd.so.1.6.0 --candidate build/lib/libzstd.so.1.6.0 --baseline-source ../baseline
+          python3 tests/lpm/parallel_integrity.py --pzstd build/contrib/pzstd/pzstd --zstd baseline-build/programs/zstd
+      - name: Pzstd unit tests
+        run: |
+          make -C contrib/pzstd -j2 tests GTEST_INC='-isystem /usr/include' GTEST_LIB='-L /usr/lib/x86_64-linux-gnu'
+          make -C contrib/pzstd check TESTFLAGS='--gtest_filter=-*ExtremelyLarge*'
+      - name: Address and undefined-behavior sanitizers
+        run: |
+          meson setup asan-build build/meson -Dbin_contrib=true -Dcpu_tune=znver2 -Db_sanitize=address,undefined -Db_lundef=false -Dzlib=disabled -Dlzma=disabled -Dlz4=disabled
+          ninja -C asan-build -j2
+          python3 tests/lpm/parallel_integrity.py --pzstd asan-build/contrib/pzstd/pzstd --zstd baseline-build/programs/zstd
+        env:
+          UBSAN_OPTIONS: halt_on_error=1
+      - name: CMake profile build
+        run: |
+          cmake -S build/cmake -B cmake-build -G Ninja -DZSTD_CPU_TUNE=znver2 -DZSTD_BUILD_CONTRIB=ON
+          cmake --build cmake-build -j2
